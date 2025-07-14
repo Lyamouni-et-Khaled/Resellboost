@@ -1,0 +1,6 @@
+discord.py
+python-dotenv
+google-generativeai
+Pillow
+google-cloud-firestore
+aiohttp
