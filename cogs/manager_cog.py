@@ -74,7 +74,7 @@ class ManagerCog(commands.Cog):
             gemini_key = os.environ.get("GEMINI_API_KEY")
             if gemini_key:
                 genai.configure(api_key=gemini_key)
-                self.model = genai.GenerativeModel('gemini-1.5-flash')
+                self.model = genai.GenerativeModel('gemini-2.5-flash')
                 print("✅ Modèle Gemini initialisé avec succès.")
             else:
                 print("⚠️ ATTENTION: La clé API Gemini (GEMINI_API_KEY) est manquante dans l'environnement. L'IA est désactivée.")
