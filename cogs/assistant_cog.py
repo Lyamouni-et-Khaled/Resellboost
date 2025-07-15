@@ -6,9 +6,13 @@ import os
 from typing import Dict, Any, Optional
 import re
 
+# Importation de ManagerCog pour l'autocomplétion
+from .manager_cog import ManagerCog
+
 # Importation de la librairie Gemini
 try:
     import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
     AI_AVAILABLE = True
 except ImportError:
     AI_AVAILABLE = False
@@ -16,7 +20,7 @@ except ImportError:
 class AssistantCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.manager: Optional['ManagerCog'] = None
+        self.manager: Optional[ManagerCog] = None
         self.model: Optional[genai.GenerativeModel] = None
 
     async def cog_load(self):
@@ -64,9 +68,9 @@ class AssistantCog(commands.Cog):
         }}
         """
         try:
-            generation_config = {
-                "response_mime_type": "application/json"
-            }
+            generation_config = GenerationConfig(
+                response_mime_type="application/json"
+            )
             response = await self.model.generate_content_async(
                 contents=prompt,
                 generation_config=generation_config

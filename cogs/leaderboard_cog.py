@@ -5,10 +5,12 @@ from discord import app_commands
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
 
+from .manager_cog import ManagerCog
+
 class LeaderboardCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.manager: Optional['ManagerCog'] = None
+        self.manager: Optional[ManagerCog] = None
 
     async def cog_load(self):
         self.manager = self.bot.get_cog('ManagerCog')

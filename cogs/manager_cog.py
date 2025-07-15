@@ -25,6 +25,7 @@ except ImportError:
 # --- Configuration de l'IA Gemini ---
 try:
     import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
     AI_AVAILABLE = True
 except ImportError:
     AI_AVAILABLE = False
@@ -32,412 +33,14 @@ except ImportError:
 # --- Configuration de Firestore ---
 try:
     from google.cloud import firestore
-    # FIX: Importation du module 'transaction' entier
+    # FIX: Importation correcte pour le décorateur et les transactions
     from google.cloud.firestore_v1 import transaction
     FIRESTORE_AVAILABLE = True
 except ImportError:
     FIRESTORE_AVAILABLE = False
 
-
-# --- Classes pour les Vues d'Interaction ---
-
-class PurchasePromoView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    @discord.ui.button(label="🛒 Acheter cette offre", style=discord.ButtonStyle.success, custom_id="buy_promo_button")
-    async def buy_promo_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-
-        footer_text = interaction.message.embeds[0].footer.text
-        match = re.search(r"ID de l'Offre: ([a-f0-9-]+)", footer_text)
-        if not match:
-            return await interaction.followup.send("ID d'offre introuvable.", ephemeral=True)
-        
-        promo_id = match.group(1)
-
-        promo_ref = self.manager.db.collection('active_promos').document(promo_id)
-        promo_doc = await promo_ref.get()
-
-        if not promo_doc.exists:
-            button.disabled = True
-            await interaction.message.edit(view=self)
-            return await interaction.followup.send("Cette offre a expiré ou n'existe plus.", ephemeral=True)
-
-        promo_data = promo_doc.to_dict()
-        ticket_channel = await self.manager.create_promo_purchase_ticket(interaction, promo_id, promo_data)
-
-        if ticket_channel:
-            await interaction.followup.send(f"Votre ticket d'achat pour la promotion a été créé : {ticket_channel.mention}", ephemeral=True)
-        else:
-            await interaction.followup.send("Impossible de créer le ticket d'achat. Veuillez contacter un administrateur.", ephemeral=True)
-
-
-class PaymentVerificationView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    async def _handle_action(self, interaction: discord.Interaction, action: str):
-        await interaction.response.defer()
-
-        footer_text = interaction.message.embeds[0].footer.text
-        match = re.search(r"ID de Transaction: ([a-f0-9-]+)", footer_text)
-        if not match:
-            return await interaction.followup.send("ID de transaction introuvable dans le message.", ephemeral=True)
-        
-        transaction_id = match.group(1)
-        
-        transaction_ref = self.manager.db.collection('pending_transactions').document(transaction_id)
-        transaction_doc = await transaction_ref.get()
-        
-        if not transaction_doc.exists:
-            for item in self.children: item.disabled = True
-            await interaction.message.edit(view=self)
-            return await interaction.followup.send("Cette transaction est introuvable ou a déjà été traitée.", ephemeral=True)
-
-        transaction_data = transaction_doc.to_dict()
-        original_embed = interaction.message.embeds[0]
-        new_embed = original_embed.copy()
-        
-        if action == "confirm":
-            product_to_record = None
-            option_to_record = None
-            
-            # Check if it's a promo or regular product purchase
-            if transaction_data.get('type') == 'promo':
-                product_to_record = {
-                    'id': transaction_data.get('promo_id'),
-                    'name': transaction_data.get('promo_name'),
-                    'price': transaction_data.get('price'),
-                    'purchase_cost': transaction_data.get('purchase_cost'),
-                    'currency': 'EUR',
-                    'margin_type': 'net'
-                }
-                display_name = product_to_record['name']
-            else:
-                product_to_record = self.manager.get_product(transaction_data['product_id'])
-                if transaction_data.get('option_name') and product_to_record.get('options'):
-                    option_to_record = next((opt for opt in product_to_record['options'] if opt['name'] == transaction_data['option_name']), None)
-                display_name = product_to_record['name'] + (f" ({option_to_record['name']})" if option_to_record else "")
-
-            if not product_to_record:
-                return await interaction.followup.send("❌ Erreur : produit ou promotion introuvable pour cette transaction.", ephemeral=True)
-
-            purchase_successful, message = await self.manager.record_purchase(
-                user_id=transaction_data['user_id'],
-                product=product_to_record,
-                option=option_to_record,
-                credit_used=transaction_data.get('credit_used', 0),
-                guild_id=interaction.guild_id,
-                transaction_code=transaction_data.get('transaction_code', 'N/A')
-            )
-
-            if not purchase_successful:
-                return await interaction.followup.send(f"❌ Erreur lors de la confirmation: {message}", ephemeral=True)
-
-            new_embed.title = "✅ Commande Validée"
-            new_embed.color = discord.Color.green()
-            new_embed.clear_fields()
-            new_embed.description = f"Le paiement pour le produit `{display_name}` a été validé."
-            new_embed.set_footer(text=f"Validé par {interaction.user.display_name} | {original_embed.footer.text}")
-            
-            buyer = interaction.guild.get_member(transaction_data['user_id'])
-            if buyer:
-                is_subscription = product_to_record.get("type") == "subscription"
-                embed_delivery = discord.Embed(
-                    title=f"✅ {'Abonnement Activé' if is_subscription else 'Commande Complétée'}",
-                    color=discord.Color.green()
-                )
-                if is_subscription:
-                    embed_delivery.description = f"Merci pour votre soutien ! Votre abonnement **{display_name}** est maintenant actif. Profitez de vos avantages exclusifs !"
-                else:
-                    embed_delivery.description = f"Merci pour votre achat de **{display_name}**!\nUn administrateur va vous contacter dans ce ticket pour vous livrer votre produit."
-                
-                await interaction.channel.send(content=f"{buyer.mention}", embed=embed_delivery, view=TicketCloseView(self.manager))
-
-        elif action == "deny":
-            new_embed.title = "❌ Paiement Refusé"
-            new_embed.color = discord.Color.red()
-            new_embed.clear_fields()
-            new_embed.description = "La commande a été refusée. Les crédits utilisés ont été remboursés."
-            new_embed.set_footer(text=f"Refusé par {interaction.user.display_name} | {original_embed.footer.text}")
-            
-            await interaction.channel.send(content="Cette commande a été refusée.", view=TicketCloseView(self.manager))
-
-
-        for item in self.children: item.disabled = True
-        await interaction.message.edit(embed=new_embed, view=self)
-
-        await transaction_ref.delete()
-
-    @discord.ui.button(label="✅ Confirmer Paiement", style=discord.ButtonStyle.success, custom_id="confirm_payment_ticket")
-    async def confirm_payment_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_action(interaction, "confirm")
-    
-    @discord.ui.button(label="❌ Refuser", style=discord.ButtonStyle.danger, custom_id="deny_payment_ticket")
-    async def deny_payment_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_action(interaction, "deny")
-
-class MissionView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-    
-    @discord.ui.button(label="Activer/Désactiver les notifications de mission", style=discord.ButtonStyle.secondary, custom_id="toggle_mission_dms")
-    async def toggle_dms(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id_str = str(interaction.user.id)
-        user_ref = self.manager.db.collection('users').document(user_id_str)
-        
-        @transaction.async_transactional
-        async def toggle_opt_in(trans, ref):
-            user_doc = await ref.get(transaction=trans)
-            user_data = user_doc.to_dict() if user_doc.exists else {}
-            new_status = not user_data.get("missions_opt_in", True)
-            trans.set(ref, {"missions_opt_in": new_status}, merge=True)
-            return new_status
-
-        trans = self.manager.db.transaction()
-        new_status = await toggle_opt_in(trans, user_ref)
-        
-        status_text = "activées" if new_status else "désactivées"
-        await interaction.response.send_message(f"Vos notifications de mission par message privé sont maintenant {status_text}.", ephemeral=True)
-
-
-class ChallengeSubmissionModal(discord.ui.Modal, title="Soumission de Défi"):
-    submission_text = discord.ui.TextInput(
-        label="Décrivez comment vous avez complété le défi",
-        style=discord.TextStyle.paragraph,
-        placeholder="Ex: J'ai aidé @utilisateur à configurer son compte en lui expliquant comment faire...",
-        required=True
-    )
-
-    def __init__(self, manager: 'ManagerCog', challenge_type: str):
-        super().__init__()
-        self.manager = manager
-        self.challenge_type = challenge_type
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.manager.handle_challenge_submission(interaction, self.submission_text.value, self.challenge_type)
-
-class CashoutModal(discord.ui.Modal, title="Demande de Retrait d'Argent"):
-    amount = discord.ui.TextInput(label="Montant en crédit à retirer", placeholder="Ex: 10.50", required=True)
-    paypal_email = discord.ui.TextInput(label="Votre email PayPal", placeholder="Ex: votre.email@example.com", style=discord.TextStyle.short, required=True)
-
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__()
-        self.manager = manager
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.manager.handle_cashout_submission(interaction, self.amount.value, self.paypal_email.value)
-
-class CashoutRequestView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    async def _handle_action(self, interaction: discord.Interaction, approve: bool):
-        await interaction.response.defer()
-        msg_id = str(interaction.message.id)
-        
-        cashout_ref = self.manager.db.collection('pending_cashouts').document(msg_id)
-        cashout_data = await cashout_ref.get()
-
-        if not cashout_data.exists:
-            for child in self.children: child.disabled = True
-            await interaction.message.edit(view=self)
-            return await interaction.followup.send("Cette demande de retrait est introuvable ou a déjà été traitée.", ephemeral=True)
-
-        cashout_dict = cashout_data.to_dict()
-        user_id_str = str(cashout_dict['user_id'])
-        user_ref = self.manager.db.collection('users').document(user_id_str)
-        member = interaction.guild.get_member(cashout_dict['user_id'])
-        
-        original_embed = interaction.message.embeds[0]
-        new_embed = original_embed.copy()
-
-        if approve:
-            trans = self.manager.db.transaction()
-            await self.manager.add_transaction(trans, user_ref, "cashout_count", 1, "Approbation de retrait")
-            if member:
-                await self.manager.check_achievements(member)
-                try:
-                    await member.send(f"✅ Votre demande de retrait de `{cashout_dict['euros_to_send']:.2f}€` a été approuvée ! Le paiement sera effectué sous peu sur l'adresse `{cashout_dict['paypal_email']}`.")
-                except discord.Forbidden: pass
-
-                cashed_out_user_data = (await user_ref.get()).to_dict()
-                referrer_id_str = cashed_out_user_data.get('referrer')
-
-                if referrer_id_str:
-                    await self.manager.grant_cashout_commission(
-                        referrer_id_str=referrer_id_str,
-                        amount_cashed_out=cashout_dict['euros_to_send'],
-                        referral_member=member,
-                        guild=interaction.guild
-                    )
-                
-            await self.manager.log_public_transaction(
-                interaction.guild,
-                f"✅ Demande de retrait approuvée pour **{member.display_name if member else 'Utilisateur Inconnu'}**.",
-                f"**Montant :** `{cashout_dict['euros_to_send']:.2f}€`\n**Validé par :** {interaction.user.mention}",
-                discord.Color.green()
-            )
-
-            new_embed.color = discord.Color.green()
-            new_embed.title = "Demande de Retrait APPROUVÉE"
-            new_embed.set_footer(text=f"Approuvé par {interaction.user.display_name}")
-            await interaction.message.edit(embed=new_embed)
-            await interaction.followup.send("Demande approuvée.", ephemeral=True)
-        else: # Deny
-            trans = self.manager.db.transaction()
-            await self.manager.add_transaction(
-                trans,
-                user_ref,
-                "store_credit",
-                cashout_dict['credit_to_deduct'],
-                "Remboursement suite au refus de retrait"
-            )
-            if member:
-                try:
-                    await member.send(f"❌ Votre demande de retrait a été refusée par le staff. Vos `{cashout_dict['credit_to_deduct']:.2f}` crédits vous ont été remboursés.")
-                except discord.Forbidden: pass
-            
-            new_embed.color = discord.Color.red()
-            new_embed.title = "Demande de Retrait REFUSÉE"
-            new_embed.set_footer(text=f"Refusé par {interaction.user.display_name}")
-            await interaction.message.edit(embed=new_embed)
-            await interaction.followup.send("Demande refusée et crédits remboursés.", ephemeral=True)
-
-        for child in self.children: child.disabled = True
-        await interaction.message.edit(view=self)
-        await cashout_ref.delete()
-
-
-    @discord.ui.button(label="✅ Approuver", style=discord.ButtonStyle.success, custom_id="approve_cashout")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_action(interaction, approve=True)
-
-    @discord.ui.button(label="❌ Refuser", style=discord.ButtonStyle.danger, custom_id="deny_cashout")
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_action(interaction, approve=False)
-
-class VerificationView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-    
-    @discord.ui.button(label="✅ Accepter le règlement", style=discord.ButtonStyle.success, custom_id="verify_member_button")
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        roles_config = self.manager.config.get("ROLES", {})
-        verified_role_name = roles_config.get("VERIFIED")
-        unverified_role_name = roles_config.get("UNVERIFIED")
-        
-        verified_role = discord.utils.get(interaction.guild.roles, name=verified_role_name) if verified_role_name else None
-        unverified_role = discord.utils.get(interaction.guild.roles, name=unverified_role_name) if unverified_role_name else None
-
-        if not verified_role:
-            return await interaction.response.send_message(f"Erreur : Le rôle `{verified_role_name}` est introuvable.", ephemeral=True)
-            
-        if verified_role in interaction.user.roles:
-            return await interaction.response.send_message("Vous êtes déjà vérifié !", ephemeral=True)
-
-        try:
-            await interaction.user.add_roles(verified_role, reason="Vérification via bouton")
-            if unverified_role and unverified_role in interaction.user.roles:
-                await interaction.user.remove_roles(unverified_role, reason="Vérification via bouton")
-            await interaction.response.send_message("Vous avez été vérifié avec succès ! Bienvenue sur le serveur.", ephemeral=True)
-            
-            user_ref = self.manager.db.collection('users').document(str(interaction.user.id))
-            user_doc = await user_ref.get()
-
-            if user_doc.exists and user_doc.to_dict().get("referrer"):
-                user_data = user_doc.to_dict()
-                referrer_id_str = user_data["referrer"]
-                referrer = interaction.guild.get_member(int(referrer_id_str))
-                if referrer:
-                    xp_config = self.manager.config.get("GAMIFICATION_CONFIG", {}).get("XP_SYSTEM", {})
-                    xp_to_add = xp_config.get("XP_PER_VERIFIED_INVITE", 100)
-                    await self.manager.grant_xp(referrer, xp_to_add, "Parrainage validé")
-            
-            await self.manager.send_onboarding_dm(interaction.user)
-
-        except discord.Forbidden:
-            await interaction.response.send_message("Je n'ai pas les permissions pour vous donner le rôle. Veuillez contacter un administrateur.", ephemeral=True)
-
-class TicketCreationView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    @discord.ui.button(label="🎫 Ouvrir un ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket_button")
-    async def create_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ticket_types = self.manager.config.get("TICKET_SYSTEM", {}).get("TICKET_TYPES", [])
-        if not ticket_types:
-            return await interaction.response.send_message("Le système de tickets n'est pas correctement configuré.", ephemeral=True)
-        
-        filtered_types = [tt for tt in ticket_types if "Achat de" not in tt.get("label")]
-        
-        await interaction.response.send_message(view=TicketTypeSelect(self.manager, filtered_types), ephemeral=True)
-
-class TicketTypeSelect(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog', ticket_types: List[Dict]):
-        super().__init__(timeout=180)
-        self.manager = manager
-        
-        options = [
-            discord.SelectOption(label=tt['label'], description=tt.get('description'), value=tt['label'])
-            for tt in ticket_types
-        ]
-        self.select_menu = discord.ui.Select(placeholder="Choisissez le type de ticket...", options=options)
-        self.select_menu.callback = self.on_select
-        self.add_item(self.select_menu)
-
-    async def on_select(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        selected_label = self.select_menu.values[0]
-        ticket_type = next((tt for tt in self.manager.config.get("TICKET_SYSTEM", {}).get("TICKET_TYPES", []) if tt['label'] == selected_label), None)
-        if not ticket_type:
-             return await interaction.followup.send("Type de ticket invalide.", ephemeral=True)
-
-        initial_embed = discord.Embed(title=f"Ticket : {ticket_type['label']}", description="Veuillez décrire votre problème en détail. Un membre du staff sera bientôt avec vous.", color=discord.Color.blue())
-        initial_embed.set_footer(text=f"Ticket créé par {interaction.user.display_name}")
-
-        ticket_channel = await self.manager.create_ticket(
-            user=interaction.user, 
-            guild=interaction.guild, 
-            ticket_type=ticket_type, 
-            embed=initial_embed, 
-            view=TicketCloseView(self.manager)
-        )
-
-        if ticket_channel:
-            await interaction.followup.send(f"Votre ticket a été créé : {ticket_channel.mention}", ephemeral=True)
-        else:
-            await interaction.followup.send("Impossible de créer le ticket. Veuillez contacter un administrateur.", ephemeral=True)
-        
-        for item in self.children:
-            item.disabled = True
-        await interaction.edit_original_response(view=self)
-
-class TicketCloseView(discord.ui.View):
-    def __init__(self, manager: 'ManagerCog'):
-        super().__init__(timeout=None)
-        self.manager = manager
-    
-    @discord.ui.button(label="🔒 Fermer le Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket_button")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        
-        channel = interaction.channel
-        button.disabled = True
-        await interaction.message.edit(view=self)
-
-        await self.manager.log_ticket_closure(interaction, channel)
-        
-        await channel.delete(reason=f"Ticket fermé par {interaction.user}")
-
-# --- Le Cog Principal ---
+# --- IMPORTANT: Ce fichier n'importe plus aucun autre cog ---
+# --- Les classes de Vues et Modals ont été déplacées dans les cogs qui les utilisent ---
 
 class ManagerCog(commands.Cog):
     """Le cerveau du bot, gère la gamification, l'économie et les données via Firestore."""
@@ -471,7 +74,7 @@ class ManagerCog(commands.Cog):
             gemini_key = os.environ.get("GEMINI_API_KEY")
             if gemini_key:
                 genai.configure(api_key=gemini_key)
-                self.model = genai.GenerativeModel('gemini-2.5-flash')
+                self.model = genai.GenerativeModel('gemini-1.5-flash')
                 print("✅ Modèle Gemini initialisé avec succès.")
             else:
                 print("⚠️ ATTENTION: La clé API Gemini (GEMINI_API_KEY) est manquante dans l'environnement. L'IA est désactivée.")
@@ -482,11 +85,6 @@ class ManagerCog(commands.Cog):
 
         await self._load_static_data()
         await self._load_active_events()
-        self.bot.add_view(VerificationView(self))
-        self.bot.add_view(TicketCreationView(self))
-        self.bot.add_view(TicketCloseView(self))
-        self.bot.add_view(CashoutRequestView(self))
-        self.bot.add_view(MissionView(self))
         self.weekly_leaderboard_task.start()
         self.mission_assignment_task.start()
         self.check_vip_status_task.start()
@@ -533,12 +131,16 @@ class ManagerCog(commands.Cog):
         print("Données de configuration statiques chargées.")
     
     async def _load_active_events(self):
-        events_doc = await self.db.collection('system').document('events').get()
-        if events_doc.exists:
-            self.active_events = events_doc.to_dict().get('active', {})
-        else:
+        try:
+            events_doc = await self.db.collection('system').document('events').get()
+            if events_doc.exists:
+                self.active_events = events_doc.to_dict().get('active', {})
+            else:
+                self.active_events = {}
+            print(f"Événements actifs chargés en mémoire: {len(self.active_events)}.")
+        except Exception as e:
+            print(f"Erreur au chargement des événements actifs: {e}")
             self.active_events = {}
-        print(f"Événements actifs chargés en mémoire: {len(self.active_events)}.")
     
     def get_product(self, product_id: str) -> Optional[Dict[str, Any]]:
         return next((p for p in self.products if p.get('id') == product_id), None)
@@ -567,7 +169,7 @@ class ManagerCog(commands.Cog):
         )
         
         try:
-            generation_config = {"response_mime_type": "application/json"}
+            generation_config = GenerationConfig(response_mime_type="application/json")
             response = await self.model.generate_content_async(contents=prompt, generation_config=generation_config)
             parsed_json = await self._parse_gemini_json_response(response.text)
             return parsed_json.get("generated_description") if parsed_json else short_description
@@ -617,11 +219,12 @@ class ManagerCog(commands.Cog):
             await user_ref.set({"referrer": str(inviter.id)}, merge=True)
             
             inviter_ref = self.db.collection('users').document(str(inviter.id))
-            trans = self.db.transaction()
-            await self.add_transaction(
-                trans, inviter_ref,
-                "referral_count", 1, f"Parrainage de {member.name}"
-            )
+            
+            @transaction.async_transactional
+            async def add_referral_tx(trans, ref):
+                await self.add_transaction(trans, ref, "referral_count", 1, f"Parrainage de {member.name}")
+            await self.db.run_transaction(add_referral_tx, inviter_ref)
+            
             print(f"{member.name} a été invité par {inviter.name}")
         
         await self._update_invite_cache(member.guild)
@@ -640,10 +243,11 @@ class ManagerCog(commands.Cog):
     async def on_invite_delete(self, invite: discord.Invite):
         await self._update_invite_cache(invite.guild)
     
-    async def get_or_create_user_data(self, user_ref: firestore.AsyncDocumentReference) -> Dict[str, Any]:
-        user_doc = await user_ref.get()
-        if user_doc.exists:
-            return user_doc.to_dict()
+    async def get_or_create_user_data(self, user_ref: firestore.AsyncDocumentReference, trans: Optional[firestore.AsyncTransaction] = None) -> Dict[str, Any]:
+        """Gets user data, creating it if it doesn't exist. Can run inside or outside a transaction."""
+        doc = await user_ref.get(transaction=trans)
+        if doc.exists:
+            return doc.to_dict()
         
         default_data = {
             "xp": 0, "level": 1, "weekly_xp": 0, "last_message_timestamp": 0,
@@ -660,37 +264,41 @@ class ManagerCog(commands.Cog):
             "current_daily_mission": None, "current_weekly_mission": None,
             "guild_id": None, "guild_bonus": {}
         }
-        await user_ref.set(default_data)
+        
+        if trans:
+            trans.set(user_ref, default_data)
+        else:
+            await user_ref.set(default_data)
+        
         print(f"Nouvel utilisateur initialisé dans Firestore : {user_ref.id}")
         return default_data
 
-    @transaction.async_transactional
-    async def add_transaction(self, trans: firestore.AsyncTransaction, user_ref: firestore.AsyncDocumentReference, type: str, amount: any, description: str):
-        user_doc = await user_ref.get(transaction=trans)
-        user_data = user_doc.to_dict() if user_doc.exists else await self.get_or_create_user_data(user_ref)
+    async def add_transaction(self, trans: firestore.AsyncTransaction, user_ref: firestore.AsyncDocumentReference, field: str, amount: any, description: str):
+        """Helper to add a transaction entry and update a user field. MUST be called from within a transaction."""
+        user_data = await self.get_or_create_user_data(user_ref, trans=trans)
         
-        new_value = user_data.get(type, 0) + amount
-        
+        current_val = user_data.get(field, 0)
+        new_value = (current_val if isinstance(current_val, (int, float)) else 0) + (amount if isinstance(amount, (int, float)) else 0)
+
         log_entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "type": type, "amount": amount, "description": description
+            "type": field, "amount": amount, "description": description
         }
         transaction_log = user_data.get("transaction_log", [])
-        transaction_log.insert(0, log_entry) # Add to the beginning
+        transaction_log.insert(0, log_entry)
         
         max_log_size = self.config.get("TRANSACTION_LOG_CONFIG", {}).get("MAX_USER_LOG_SIZE", 50)
         if len(transaction_log) > max_log_size:
             transaction_log = transaction_log[:max_log_size]
             
         update_payload = {
-            type: new_value,
+            field: new_value,
             "transaction_log": transaction_log
         }
         trans.update(user_ref, update_payload)
 
     async def grant_xp(self, user: discord.Member, source: any, reason: str, _is_achievement_reward: bool = False):
-        user_id_str = str(user.id)
-        user_ref = self.db.collection('users').document(user_id_str)
+        user_ref = self.db.collection('users').document(str(user.id))
         xp_config = self.config.get("GAMIFICATION_CONFIG", {}).get("XP_SYSTEM", {})
         
         user_data = await self.get_or_create_user_data(user_ref)
@@ -701,15 +309,14 @@ class ManagerCog(commands.Cog):
         now = datetime.now(timezone.utc)
         
         xp_to_add = 0
-        trans = self.db.transaction()
-        if source == "message":
+        is_message_source = (source == "message")
+        
+        if is_message_source:
             cooldown = xp_config.get("ANTI_FARM_COOLDOWN_SECONDS", 60)
             last_msg_ts = user_data.get("last_message_timestamp", 0)
             if now.timestamp() - last_msg_ts < cooldown: return
             xp_per_message_range = xp_config.get("XP_PER_MESSAGE", [10, 20])
             xp_to_add = random.randint(*xp_per_message_range)
-            await user_ref.update({"last_message_timestamp": now.timestamp()})
-            await self.add_transaction(trans, user_ref, "message_count", 1, reason)
         elif isinstance(source, int):
             xp_to_add = source
         
@@ -717,9 +324,8 @@ class ManagerCog(commands.Cog):
 
         # --- Calculate Boosts ---
         total_boost = 1.0
-        # VIP Bonus
         vip_data = user_data.get("vip_premium")
-        if vip_data and datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00")) > now:
+        if vip_data and datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00").split('.')[0]) > now:
             vip_config = self.config.get("GAMIFICATION_CONFIG", {}).get("VIP_SYSTEM", {}).get("PREMIUM", {})
             sorted_tiers = sorted(vip_config.get("XP_BOOST_TIERS", []), key=lambda x: x.get("consecutive_months", 0), reverse=True)
             for tier in sorted_tiers:
@@ -727,27 +333,27 @@ class ManagerCog(commands.Cog):
                     total_boost += tier.get("boost", 0)
                     break
         
-        # Check for active XP boosters from shop
         active_boosters = user_data.get("active_boosters", {})
         for booster_id, booster_data in active_boosters.items():
             if 'xp_booster' in booster_id and datetime.fromisoformat(booster_data.get('expires_at', "1970-01-01T00:00:00+00:00")) > now:
-                total_boost += booster_data.get('multiplier', 1.0) - 1.0 # e.g., 1.25 -> 0.25
+                total_boost += booster_data.get('multiplier', 1.0) - 1.0
         
-        # Event bonus
         event_multiplier = self.active_events.get("double_xp", {}).get("multiplier", 1.0)
         final_xp = int(xp_to_add * total_boost * event_multiplier)
         
         @transaction.async_transactional
-        async def _update_xp_and_guild(trans, user_ref, guild_ref, final_xp, reason):
-            await self.add_transaction(trans, user_ref, "xp", final_xp, reason)
-            await self.add_transaction(trans, user_ref, "weekly_xp", final_xp, f"Gain hebdomadaire: {reason}")
-            if guild_ref:
-                trans.update(guild_ref, {"weekly_xp": firestore.Increment(final_xp)})
+        async def _update_xp_and_guild(trans, u_ref, guild_id, xp, rsn, is_msg):
+            guild_ref = self.db.collection('guilds').document(guild_id) if guild_id else None
+            if is_msg:
+                trans.update(u_ref, {"last_message_timestamp": now.timestamp()})
+                await self.add_transaction(trans, u_ref, "message_count", 1, rsn)
 
-        guild_id = user_data.get("guild_id")
-        guild_ref = self.db.collection('guilds').document(guild_id) if guild_id else None
-        
-        await _update_xp_and_guild(self.db.transaction(), user_ref, guild_ref, final_xp, reason)
+            await self.add_transaction(trans, u_ref, "xp", xp, rsn)
+            await self.add_transaction(trans, u_ref, "weekly_xp", xp, f"Gain hebdomadaire: {rsn}")
+            if guild_ref and (await guild_ref.get(transaction=trans)).exists:
+                trans.update(guild_ref, {"weekly_xp": firestore.Increment(xp)})
+
+        await self.db.run_transaction(_update_xp_and_guild, user_ref, user_data.get("guild_id"), final_xp, reason, is_message_source)
 
         leveled_up, new_level = await self.check_level_up(user)
         
@@ -783,8 +389,7 @@ class ManagerCog(commands.Cog):
 
     async def check_level_up(self, user: discord.Member) -> tuple[bool, int]:
         user_ref = self.db.collection('users').document(str(user.id))
-        user_data = (await user_ref.get()).to_dict()
-        if not user_data: return False, 1
+        user_data = await self.get_or_create_user_data(user_ref)
 
         if user_data.get("xp_gated", False): return False, user_data.get("level", 1)
         
@@ -798,22 +403,24 @@ class ManagerCog(commands.Cog):
             return False, old_level
             
         new_level = old_level
-        while user_data.get("xp", 0) >= int(base_xp * (multiplier ** new_level)):
+        current_xp = user_data.get("xp", 0)
+        while current_xp >= int(base_xp * (multiplier ** new_level)):
             new_level += 1
         
-        trans = self.db.transaction()
-        await self.add_transaction(trans, user_ref, "level", new_level - old_level, "Montée de niveau")
-        
-        await self.check_referral_milestones(user, user_data)
-        # DM logic and role rewards...
-        return True, new_level
+        if new_level == old_level: return False, old_level
 
+        @transaction.async_transactional
+        async def level_up_tx(trans, ref):
+            await self.add_transaction(trans, ref, "level", new_level - old_level, "Montée de niveau")
+        await self.db.run_transaction(level_up_tx, user_ref)
+
+        await self.check_referral_milestones(user, user_data)
+        return True, new_level
 
     async def check_achievements(self, user: discord.Member):
         if not user: return
         user_ref = self.db.collection('users').document(str(user.id))
-        user_stats = (await user_ref.get()).to_dict()
-        if not user_stats: return
+        user_stats = await self.get_or_create_user_data(user_ref)
 
         for achievement in self.achievements:
             if achievement.get("id") in user_stats.get("achievements", []): continue
@@ -828,7 +435,11 @@ class ManagerCog(commands.Cog):
         if (xp_reward := achievement.get("reward_xp", 0)) > 0:
             await self.grant_xp(user, xp_reward, f"Succès: {achievement.get('name')}", _is_achievement_reward=True)
         
-        # Announcement logic remains the same...
+        channel_name = self.config.get("CHANNELS", {}).get("ACHIEVEMENT_ANNOUNCEMENTS")
+        if channel_name:
+            channel = discord.utils.get(user.guild.text_channels, name=channel_name)
+            if channel:
+                await channel.send(f"🏆 Succès Déverrouillé ! Bravo {user.mention} pour avoir obtenu **{achievement.get('name')}** !")
 
     async def record_purchase(self, user_id: int, product: dict, option: Optional[dict], credit_used: float, guild_id: int, transaction_code: str) -> tuple[bool, str]:
         guild = self.bot.get_guild(guild_id)
@@ -858,15 +469,14 @@ class ManagerCog(commands.Cog):
                  role = discord.utils.get(guild.roles, name=vip_role_name)
                  if role: await member.add_roles(role)
 
-        trans = self.db.transaction()
         @transaction.async_transactional
-        async def purchase_transaction(trans, buyer_ref, price, credit_used):
-            await self.add_transaction(trans, buyer_ref, "purchase_count", 1, "Achat")
-            await self.add_transaction(trans, buyer_ref, "purchase_total_value", price, "Achat")
-            if credit_used > 0:
-                await self.add_transaction(trans, buyer_ref, "store_credit", -credit_used, "Achat avec crédit")
+        async def purchase_transaction(trans, b_ref, p, c_used):
+            await self.add_transaction(trans, b_ref, "purchase_count", 1, "Achat")
+            await self.add_transaction(trans, b_ref, "purchase_total_value", p, "Achat")
+            if c_used > 0:
+                await self.add_transaction(trans, b_ref, "store_credit", -c_used, "Achat avec crédit")
         
-        await purchase_transaction(trans, buyer_ref, price, credit_used)
+        await self.db.run_transaction(purchase_transaction, buyer_ref, price, credit_used)
 
         xp_per_euro = self.config.get("GAMIFICATION_CONFIG", {}).get("XP_SYSTEM", {}).get("XP_PER_EURO_SPENT", 20)
         xp_gain = int(price * xp_per_euro)
@@ -878,13 +488,16 @@ class ManagerCog(commands.Cog):
         if referrer_id_str:
             referrer = guild.get_member(int(referrer_id_str))
             if referrer:
-                referrer_data = await self.get_or_create_user_data(self.db.collection('users').document(referrer_id_str))
+                referrer_ref = self.db.collection('users').document(referrer_id_str)
+                referrer_data = await self.get_or_create_user_data(referrer_ref)
                 commission_earned = self.calculate_commission(referrer_data, price, product, option)
                 if commission_earned > 0:
-                    ref_transaction = self.db.transaction()
-                    await self.add_transaction(ref_transaction, self.db.collection('users').document(referrer_id_str), "store_credit", commission_earned, f"Commission sur achat de {member.display_name}")
-                    await self.add_transaction(ref_transaction, self.db.collection('users').document(referrer_id_str), "affiliate_earnings", commission_earned, "Gain d'affiliation")
-                    await self.add_transaction(ref_transaction, self.db.collection('users').document(referrer_id_str), "weekly_affiliate_earnings", commission_earned, "Gain d'affiliation hebdo")
+                    @transaction.async_transactional
+                    async def commission_tx(trans, ref):
+                        await self.add_transaction(trans, ref, "store_credit", commission_earned, f"Commission sur achat de {member.display_name}")
+                        await self.add_transaction(trans, ref, "affiliate_earnings", commission_earned, "Gain d'affiliation")
+                        await self.add_transaction(trans, ref, "weekly_affiliate_earnings", commission_earned, "Gain d'affiliation hebdo")
+                    await self.db.run_transaction(commission_tx, referrer_ref)
                     await self.check_achievements(referrer)
         
         return True, "Achat enregistré."
@@ -908,7 +521,7 @@ class ManagerCog(commands.Cog):
         
         total_boost = 0.0
         vip_data = referrer_data.get("vip_premium")
-        if vip_data and datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00")) > now:
+        if vip_data and datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00").split('.')[0]) > now:
             total_boost += next((t.get('bonus', 0) for t in sorted(vip_config.get("COMMISSION_BONUS_TIERS", []), key=lambda x: x.get('consecutive_months', 0), reverse=True) if vip_data.get("consecutive_months", 0) >= t.get('consecutive_months', 999)), 0)
             
         if referrer_data.get("permanent_affiliate_bonus", False):
@@ -942,49 +555,46 @@ class ManagerCog(commands.Cog):
         cashout_config = self.config.get("GAMIFICATION_CONFIG", {}).get("AFFILIATE_SYSTEM", {}).get("CASHOUT_COMMISSION", {})
         guild_bonus = referrer_data.get("guild_bonus", {})
         
-        # Start with the base rate
         rate = cashout_config.get("BASE_RATE", 0.05)
         
-        # Guild bonus takes precedence over all other bonuses
         guild_bonus_type = guild_bonus.get("type")
         if guild_bonus_type in ['top1', 'top2', 'top3']:
-            # The cashout_commission_rate is stored in the user's guild_bonus dict
             rate = guild_bonus.get("cashout_commission_rate", rate)
-        # If no guild bonus applies, check for VIP status
         elif referrer_data.get("vip_premium"):
             rate = cashout_config.get("VIP_RATE", rate)
 
         commission_earned = amount_cashed_out * rate
         if commission_earned > 0:
-            trans = self.db.transaction()
-            await self.add_transaction(trans, referrer_ref, "store_credit", commission_earned, f"Commission sur cashout de {referral_member.display_name}")
-            await self.add_transaction(trans, referrer_ref, "affiliate_earnings", commission_earned, "Gain d'affiliation (cashout)")
-            await self.add_transaction(trans, referrer_ref, "weekly_affiliate_earnings", commission_earned, "Gain d'affiliation hebdo (cashout)")
+            @transaction.async_transactional
+            async def cashout_commission_tx(trans, ref):
+                await self.add_transaction(trans, ref, "store_credit", commission_earned, f"Commission sur cashout de {referral_member.display_name}")
+                await self.add_transaction(trans, ref, "affiliate_earnings", commission_earned, "Gain d'affiliation (cashout)")
+                await self.add_transaction(trans, ref, "weekly_affiliate_earnings", commission_earned, "Gain d'affiliation hebdo (cashout)")
+            await self.db.run_transaction(cashout_commission_tx, referrer_ref)
+            
             try:
                 await referrer.send(f"💸 Votre filleul {referral_member.display_name} a retiré de l'argent ! Vous gagnez une commission de **{commission_earned:.2f} crédits**.")
             except discord.Forbidden: pass
-
 
     async def handle_xp_purchase(self, interaction: discord.Interaction, credits_to_spend: float):
         user_ref = self.db.collection('users').document(str(interaction.user.id))
         xp_config = self.config.get("GAMIFICATION_CONFIG", {}).get("XP_SYSTEM", {}).get("XP_PURCHASE", {})
         
         @transaction.async_transactional
-        async def purchase_xp_tx(trans, user_ref, credits):
-            user_data = (await user_ref.get(transaction=trans)).to_dict()
+        async def purchase_xp_tx(trans, u_ref, credits):
+            user_data = await self.get_or_create_user_data(u_ref, trans)
             if user_data.get("store_credit", 0) < credits:
                 return {"success": False, "reason": "Fonds insuffisants."}
             
             cost_per_xp = xp_config.get("COST_PER_XP_IN_CREDITS", 0.01)
-            # Apply VIP discount if applicable
             xp_gained = math.floor(credits / cost_per_xp)
             
-            await self.add_transaction(trans, user_ref, "store_credit", -credits, f"Achat de {xp_gained} XP")
-            await self.add_transaction(trans, user_ref, "xp", xp_gained, f"Achat avec {credits} crédits")
+            await self.add_transaction(trans, u_ref, "store_credit", -credits, f"Achat de {xp_gained} XP")
+            await self.add_transaction(trans, u_ref, "xp", xp_gained, f"Achat avec {credits} crédits")
             
             return {"success": True, "xp_gained": xp_gained}
 
-        result = await purchase_xp_tx(self.db.transaction(), user_ref, credits_to_spend)
+        result = await self.db.run_transaction(purchase_xp_tx, user_ref, credits_to_spend)
 
         if result["success"]:
             await self.check_level_up(interaction.user)
@@ -1021,18 +631,29 @@ class ManagerCog(commands.Cog):
             return await interaction.followup.send(f"❌ Le montant minimum de retrait pour votre niveau est de **{threshold:.2f} crédits**.", ephemeral=True)
         
         euros_to_send = amount * cashout_config.get("CREDIT_TO_EUR_RATE", 1.0)
-        await self.add_transaction(self.db.transaction(), user_ref, "store_credit", -amount, f"Demande de retrait de {amount:.2f} crédits")
+        
+        @transaction.async_transactional
+        async def cashout_request_tx(trans, ref):
+            await self.add_transaction(trans, ref, "store_credit", -amount, f"Demande de retrait de {amount:.2f} crédits")
+        await self.db.run_transaction(cashout_request_tx, user_ref)
         
         requests_channel_name = self.config.get("CHANNELS", {}).get("CASHOUT_REQUESTS")
         if not requests_channel_name:
-            await self.add_transaction(self.db.transaction(), user_ref, "store_credit", amount, "Remboursement - Erreur canal de retrait")
+            @transaction.async_transactional
+            async def refund_tx(trans, ref):
+                await self.add_transaction(trans, ref, "store_credit", amount, "Remboursement - Erreur canal de retrait")
+            await self.db.run_transaction(refund_tx, user_ref)
             return await interaction.followup.send("❌ Erreur critique : le salon des demandes de retrait n'est pas configuré. Votre demande a été annulée et vos crédits restaurés.", ephemeral=True)
 
         channel = discord.utils.get(interaction.guild.text_channels, name=requests_channel_name)
         if not channel:
-            await self.add_transaction(self.db.transaction(), user_ref, "store_credit", amount, "Remboursement - Erreur canal de retrait")
+            @transaction.async_transactional
+            async def refund_tx_2(trans, ref):
+                await self.add_transaction(trans, ref, "store_credit", amount, "Remboursement - Erreur canal de retrait")
+            await self.db.run_transaction(refund_tx_2, user_ref)
             return await interaction.followup.send("❌ Erreur critique : le salon des demandes de retrait est introuvable. Votre demande a été annulée et vos crédits restaurés.", ephemeral=True)
-            
+
+        from .admin_cog import CashoutRequestView # Local import
         embed = discord.Embed(title="Nouvelle Demande de Retrait", color=discord.Color.gold())
         embed.add_field(name="Membre", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Crédits Retirés", value=f"`{amount:.2f}`", inline=True)
@@ -1138,7 +759,7 @@ class ManagerCog(commands.Cog):
         async for doc in query:
             user_data = doc.to_dict()
             vip_data = user_data.get("vip_premium", {})
-            expires_at = datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00"))
+            expires_at = datetime.fromisoformat(vip_data.get("expires_at", "1970-01-01T00:00:00+00:00").split('.')[0])
             
             if now > expires_at:
                 member = guild.get_member(int(doc.id))
@@ -1167,7 +788,7 @@ class ManagerCog(commands.Cog):
                     weekly_affiliate_earnings=user_data.get('weekly_affiliate_earnings', 0.0)
                 )
                 try:
-                    response = await self.model.generate_content_async(contents=prompt)
+                    response = await self.model.generate_content_async(prompt)
                     await user.send(response.text)
                 except Exception as e:
                     print(f"Erreur envoi coaching DM à {user_id}: {e}")
@@ -1190,9 +811,11 @@ class ManagerCog(commands.Cog):
                         await member.remove_roles(role, reason="Réinitialisation classement hebdo")
                     except discord.HTTPException: pass
         
+        batch = self.db.batch()
         all_users_stream = self.db.collection('users').stream()
         async for user_doc in all_users_stream:
-            await user_doc.reference.update({"guild_bonus": {}})
+            batch.update(user_doc.reference, {"guild_bonus": {}})
+        await batch.commit()
         
         users_top_query = self.db.collection('users').where('weekly_xp', '>', 0).order_by('weekly_xp', direction=firestore.Query.DESCENDING).limit(3)
         top_users_docs = [doc async for doc in users_top_query.stream()]
@@ -1229,19 +852,27 @@ class ManagerCog(commands.Cog):
                 
                 if (reward_key := f"TOP_{rank}") in guild_rewards_config:
                     bonus_data = {**guild_rewards_config[reward_key], "type": f'top{rank}'}
+                    guild_members_batch = self.db.batch()
                     for member_id_str in guild_data.get('members', []):
-                        await self.db.collection('users').document(member_id_str).update({"guild_bonus": bonus_data})
+                        member_ref = self.db.collection('users').document(member_id_str)
+                        guild_members_batch.update(member_ref, {"guild_bonus": bonus_data})
+                    await guild_members_batch.commit()
             embed.description = description or "Aucune guilde n'a gagné d'XP cette semaine."
             embed.set_footer(text="Les bonus de commission sont actifs pour la semaine à venir !")
             await guild_lb_channel.send(embed=embed)
         
+        # Reset weekly stats
+        reset_batch = self.db.batch()
         all_users_reset_stream = self.db.collection('users').stream()
         async for user_doc in all_users_reset_stream:
-            await user_doc.reference.update({"weekly_xp": 0, "weekly_affiliate_earnings": 0, "affiliate_booster": 0.0})
+            reset_batch.update(user_doc.reference, {"weekly_xp": 0, "weekly_affiliate_earnings": 0, "affiliate_booster": 0.0})
+        await reset_batch.commit()
             
+        guild_reset_batch = self.db.batch()
         all_guilds_reset_stream = self.db.collection('guilds').stream()
         async for guild_doc in all_guilds_reset_stream:
-            await guild_doc.reference.update({"weekly_xp": 0})
+            guild_reset_batch.update(guild_doc.reference, {"weekly_xp": 0})
+        await guild_reset_batch.commit()
             
         print("Tâche de classement hebdomadaire terminée.")
 
@@ -1251,5 +882,6 @@ class ManagerCog(commands.Cog):
     @weekly_coaching_report_task.before_loop
     async def before_weekly_task(self):
         await self.bot.wait_until_ready()
-    
-    # ... The rest of the file would be similarly refactored
+        
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ManagerCog(bot))

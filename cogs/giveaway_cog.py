@@ -10,6 +10,9 @@ import os
 import asyncio
 import re
 
+# Importation de ManagerCog pour l'autocomplétion
+from .manager_cog import ManagerCog
+
 def parse_duration(duration_str: str) -> Optional[timedelta]:
     """Parses a duration string like '1d3h30m' into a timedelta object."""
     regex = re.compile(r'((?P<days>\d+)d)?((?P<hours>\d+)h)?((?P<minutes>\d+)m)?((?P<seconds>\d+)s)?')
@@ -28,7 +31,7 @@ def parse_duration(duration_str: str) -> Optional[timedelta]:
 class GiveawayCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.manager: Optional['ManagerCog'] = None
+        self.manager: Optional[ManagerCog] = None
 
     async def cog_load(self):
         self.manager = self.bot.get_cog('ManagerCog')
@@ -166,10 +169,7 @@ class GiveawayCog(commands.Cog):
         
         # Clean up fields
         new_embed.clear_fields()
-        if 'winners' in locals() and users:
-            new_embed.add_field(name="Gagnant(s)", value=", ".join([w.display_name for w in winners]), inline=False)
-        else:
-            new_embed.add_field(name="Gagnant(s)", value="Aucun participant.", inline=False)
+        new_embed.add_field(name="Gagnant(s)", value=new_embed.fields[0].value if new_embed.fields else "Aucun participant.", inline=False)
         
         await giveaway_msg.edit(embed=new_embed, view=None)
 

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from google.cloud import firestore
 
+from .manager_cog import ManagerCog
+
 def parse_duration(duration_str: str) -> Optional[timedelta]:
     """Parses a duration string like '1d3h30m' into a timedelta object."""
     regex = re.compile(r'((?P<days>\d+)d)?((?P<hours>\d+)h)?((?P<minutes>\d+)m)?((?P<seconds>\d+)s)?')
@@ -26,7 +28,7 @@ def parse_duration(duration_str: str) -> Optional[timedelta]:
 class EventsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.manager: Optional['ManagerCog'] = None
+        self.manager: Optional[ManagerCog] = None
 
     async def cog_load(self):
         self.manager = self.bot.get_cog('ManagerCog')
