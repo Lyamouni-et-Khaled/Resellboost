@@ -1,0 +1,16 @@
+# Fichiers de configuration locaux
+config.json
+service-account.json
+.env
+
+# Fichiers Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dossiers d'environnement virtuels
+venv/
+.venv/
+env/
+
